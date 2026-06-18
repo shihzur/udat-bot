@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-UDATA Lab Telegram Bot - MVP v1.0
-Workflow: photo → OCR (Claude) → ClickUp task → intake WhatsApp + Sheets link
+UDATA Lab Telegram Bot - MVP v1.1
+Workflow: photo → OCR (Claude) → ClickUp task + Sheets (auto) → intake WhatsApp
 """
 
 import os, base64, json, logging, requests
@@ -11,19 +11,16 @@ import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
-load_dotenv()  # loads .env file automatically
+load_dotenv()
 
-logging.basicConfig(
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Config ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY")
 CLICKUP_TOKEN   = os.getenv("CLICKUP_TOKEN")
-CLICKUP_LIST_ID = "901817725456"  # Diagnostics list
+CLICKUP_LIST_ID = "901817725456"
 SHEETS_URL      = (
     "https://script.google.com/macros/s/"
     "AKfycbxP-mBb6C_TRlQbQENlbPfqn4v_jo8LwRe9RuuES-RsRsdti53Efpu2ruUpDgwQuhVx/exec"
@@ -33,7 +30,7 @@ FREE_DIAG_NAMES = {"מדי מחשבים", "hanan", "oren technologies"}
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-# ── ClickUp API ──────────────────────────────────────────────────────────────
+# ── ClickUp ──────────────────────────────────────────────────────────────────
 def clickup_create_task(name: str, description: str) -> str:
     resp = requests.post(
         f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task",
@@ -43,6 +40,27 @@ def clickup_create_task(name: str, description: str) -> str:
     )
     resp.raise_for_status()
     return resp.json()["id"]
+
+# ── Google Sheets (автоматически) ────────────────────────────────────────────
+def sheets_add_row(data: dict) -> bool:
+    """Автоматически добавляет строку в Google Sheets."""
+    try:
+        model = data['model'].replace('/', '%2F').replace(' ', '+')
+        phone = str(data['phone']).replace(' ', '+')
+        url = (
+            f"{SHEETS_URL}"
+            f"?case_number={data['case_number']}"
+            f"&phone={phone}"
+            f"&model={model}"
+            f"&serial={data['serial']}"
+            f"&capacity={data['capacity']}"
+        )
+        resp = requests.get(url, timeout=20, allow_redirects=True)
+        logger.info(f"Sheets response: {resp.status_code}")
+        return True
+    except Exception as e:
+        logger.error(f"Sheets error: {e}")
+        return False
 
 # ── OCR via Claude Vision ─────────────────────────────────────────────────────
 def extract_label_data(image_bytes: bytes) -> dict:
@@ -62,10 +80,15 @@ Extract EXACTLY these fields as pure JSON (use "—" if not visible):
   "capacity": "e.g. 1TB, 500GB"
 }
 
-RULES:
+CRITICAL RULES:
+- The UDATA sticker has TWO sections:
+  LEFT side: U-Data contact info (www.udata.co.il, 072-249-4570) — IGNORE THIS COMPLETELY
+  RIGHT side: case number, "בדיקה", and the CLIENT phone/dealer code — extract ONLY from RIGHT side
+- NEVER use 072-249-4570 as the phone — that is UDATA's own number, not the client
 - 4-digit number (1209, 9090, 1414) = DEALER CODE → is_dealer=true
-- Name like "Hanan", "מדי מחשבים" = DEALER → is_dealer=true
-- Phone 05X-XXXXXXX = regular client → is_dealer=false
+- Name like "Hanan", "מדי מחשבים", "ETL", "לפי מחשבים" = DEALER → is_dealer=true
+- Phone 05X-XXXXXXX or 054-XXXXXXX = regular client → is_dealer=false
+- Code like "ETL-205310" = dealer code → is_dealer=true, phone="ETL-205310"
 - Return ONLY valid JSON, no markdown"""
 
     response = claude.messages.create(
@@ -110,18 +133,6 @@ def build_wa_intake(data: dict) -> str:
         f"📞 072-249-4570"
     )
 
-def build_sheets_url(data: dict) -> str:
-    model = data['model'].replace('/', '%2F').replace(' ', '+')
-    phone = str(data['phone']).replace(' ', '+')
-    return (
-        f"{SHEETS_URL}"
-        f"?case_number={data['case_number']}"
-        f"&phone={phone}"
-        f"&model={model}"
-        f"&serial={data['serial']}"
-        f"&capacity={data['capacity']}"
-    )
-
 def build_wa_link(data: dict, wa_text: str) -> str:
     encoded = quote(wa_text)
     if not data.get("is_dealer") and data.get("phone", "—") != "—":
@@ -137,13 +148,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 שלום! אני בוט UDATA Lab.\n\n"
         "📸 שלח לי צילום של מדבקת הדיסק ואני אדאג לכל השאר:\n\n"
         "✅ יצירת משימה ב-ClickUp\n"
-        "💬 הודעת קבלה ל-WhatsApp\n"
-        "📊 קישור לטבלה"
+        "📊 הוספה אוטומטית לטבלה\n"
+        "💬 הודעת קבלה ל-WhatsApp"
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("📷 מעבד תמונה...")
     try:
+        # Download photo
         photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
         image_bytes = await photo_file.download_as_bytearray()
 
@@ -167,18 +179,25 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         task_id = clickup_create_task(task_name, task_desc)
 
-        wa_text    = build_wa_intake(data)
-        wa_link    = build_wa_link(data, wa_text)
-        sheets_url = build_sheets_url(data)
-        cu_link    = f"https://app.clickup.com/t/{task_id}"
-        free_note  = "\n🆓 דילר — דיאגנוסטיקה חינם" if is_free_diag(data) else ""
+        # ✅ AUTO-ADD TO SHEETS
+        await msg.edit_text("📊 מוסיף לטבלה...")
+        sheets_ok = sheets_add_row(data)
+
+        # Build WhatsApp
+        wa_text = build_wa_intake(data)
+        wa_link = build_wa_link(data, wa_text)
+        cu_link = f"https://app.clickup.com/t/{task_id}"
+
+        free_note = "\n🆓 דילר — דיאגנוסטיקה חינם" if is_free_diag(data) else ""
+        sheets_note = "✅" if sheets_ok else "⚠️ בדוק ידנית"
 
         reply = (
             f"✅ *תיק {data['case_number']} נוצר*\n\n"
             f"📱 {data['phone']}{'  (דילר)' if data['is_dealer'] else ''}{free_note}\n"
             f"💾 {data['brand']} {data['media_type']} {data['capacity']}\n"
             f"🔧 {data['model']}\n"
-            f"🔑 {data['serial']}\n\n"
+            f"🔑 {data['serial']}\n"
+            f"📊 Sheets: {sheets_note}\n\n"
             f"*הודעת קבלה (העתק ל-WhatsApp):*\n"
             f"```\n{wa_text}\n```"
         )
@@ -186,9 +205,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("📲 WhatsApp", url=wa_link),
-                InlineKeyboardButton("📊 Sheets", url=sheets_url),
-            ],
-            [InlineKeyboardButton("🔗 ClickUp", url=cu_link)]
+                InlineKeyboardButton("🔗 ClickUp", url=cu_link),
+            ]
         ])
 
         await msg.delete()
@@ -211,7 +229,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    logger.info("🤖 UDATA Bot started!")
+    logger.info("🤖 UDATA Bot v1.1 started!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
