@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-UDATA Lab Telegram Bot - MVP v1.1
-Workflow: photo → OCR (Claude) → ClickUp task + Sheets (auto) → intake WhatsApp
+UDATA Lab Telegram Bot - v1.2
+Added: delivery method selection (walk-in vs mail/courier)
 """
 
 import os, base64, json, logging, requests
@@ -9,7 +9,10 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, MessageHandler, CommandHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
 
 load_dotenv()
 
@@ -26,7 +29,7 @@ SHEETS_URL      = (
     "AKfycbxP-mBb6C_TRlQbQENlbPfqn4v_jo8LwRe9RuuES-RsRsdti53Efpu2ruUpDgwQuhVx/exec"
 )
 FREE_DIAG_CODES = {"1209", "1414", "NTL", "FM", "9090"}
-FREE_DIAG_NAMES = {"מדי מחשבים", "hanan", "oren technologies"}
+FREE_DIAG_NAMES = {"מדי מחשבים", "hanan", "oren technologies", "etl"}
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
@@ -41,9 +44,8 @@ def clickup_create_task(name: str, description: str) -> str:
     resp.raise_for_status()
     return resp.json()["id"]
 
-# ── Google Sheets (автоматически) ────────────────────────────────────────────
+# ── Google Sheets ─────────────────────────────────────────────────────────────
 def sheets_add_row(data: dict) -> bool:
-    """Автоматически добавляет строку в Google Sheets."""
     try:
         model = data['model'].replace('/', '%2F').replace(' ', '+')
         phone = str(data['phone']).replace(' ', '+')
@@ -55,14 +57,13 @@ def sheets_add_row(data: dict) -> bool:
             f"&serial={data['serial']}"
             f"&capacity={data['capacity']}"
         )
-        resp = requests.get(url, timeout=20, allow_redirects=True)
-        logger.info(f"Sheets response: {resp.status_code}")
+        requests.get(url, timeout=20, allow_redirects=True)
         return True
     except Exception as e:
         logger.error(f"Sheets error: {e}")
         return False
 
-# ── OCR via Claude Vision ─────────────────────────────────────────────────────
+# ── OCR ──────────────────────────────────────────────────────────────────────
 def extract_label_data(image_bytes: bytes) -> dict:
     b64 = base64.standard_b64encode(image_bytes).decode()
     prompt = """You are reading a disk/device label at UDATA Data Recovery Lab (Israel).
@@ -82,13 +83,13 @@ Extract EXACTLY these fields as pure JSON (use "—" if not visible):
 
 CRITICAL RULES:
 - The UDATA sticker has TWO sections:
-  LEFT side: U-Data contact info (www.udata.co.il, 072-249-4570) — IGNORE THIS COMPLETELY
-  RIGHT side: case number, "בדיקה", and the CLIENT phone/dealer code — extract ONLY from RIGHT side
-- NEVER use 072-249-4570 as the phone — that is UDATA's own number, not the client
+  LEFT side: U-Data contact info (www.udata.co.il, 072-249-4570) — IGNORE COMPLETELY
+  RIGHT side: case number, "בדיקה", and CLIENT phone/dealer — extract ONLY from RIGHT side
+- NEVER use 072-249-4570 as phone — that is UDATA's own number
 - 4-digit number (1209, 9090, 1414) = DEALER CODE → is_dealer=true
 - Name like "Hanan", "מדי מחשבים", "ETL", "לפי מחשבים" = DEALER → is_dealer=true
-- Phone 05X-XXXXXXX or 054-XXXXXXX = regular client → is_dealer=false
-- Code like "ETL-205310" = dealer code → is_dealer=true, phone="ETL-205310"
+- Code like "ETL-205310" = dealer → is_dealer=true, phone="ETL-205310"
+- Phone 05X-XXXXXXX = regular client → is_dealer=false
 - Return ONLY valid JSON, no markdown"""
 
     response = claude.messages.create(
@@ -118,7 +119,8 @@ def is_free_diag(data: dict) -> bool:
     phone = str(data.get("phone", "")).strip()
     return phone in FREE_DIAG_CODES or phone.lower() in FREE_DIAG_NAMES
 
-def build_wa_intake(data: dict) -> str:
+def build_wa_walkin(data: dict) -> str:
+    """WhatsApp for walk-in clients."""
     media = f"{data['brand']} {data['media_type']} {data['capacity']}".strip()
     return (
         f"שלום 😊\n\n"
@@ -133,29 +135,43 @@ def build_wa_intake(data: dict) -> str:
         f"📞 072-249-4570"
     )
 
-def build_wa_link(data: dict, wa_text: str) -> str:
+def build_wa_mail(data: dict) -> str:
+    """WhatsApp when disk was brought by someone else on behalf of the owner."""
+    media = f"{data['brand']} {data['media_type']} {data['capacity']}".strip()
+    return (
+        f"שלום 😊\n\n"
+        f"קיבלנו את הכונן שלך למעבדה.\n\n"
+        f"פרטי הקבלה:\n"
+        f"🔢 מספר עבודה: *{data['case_number']}*\n"
+        f"💾 מדיה: *{media}*\n\n"
+        f"בקרוב נשלח אליך *קישור לתשלום* עבור עלות הבדיקה.\n"
+        f"מיד עם קבלת התשלום נתחיל בבדיקה ונעדכן אותך בממצאים 🔍\n\n"
+        f"❓ על שם מי להוציא קבלה?\n\n"
+        f"אני כאן לכל שאלה 😊\n\n"
+        f"_UDATA – Data Recovery Lab_\n"
+        f"📞 072-249-4570"
+    )
+
+def build_wa_link(phone: str, wa_text: str, is_dealer: bool) -> str:
     encoded = quote(wa_text)
-    if not data.get("is_dealer") and data.get("phone", "—") != "—":
-        phone = str(data['phone']).replace('-', '').replace(' ', '')
-        if phone.startswith('0'):
-            phone = '972' + phone[1:]
-        return f"https://wa.me/{phone}?text={encoded}"
+    if not is_dealer and phone != "—":
+        p = phone.replace('-', '').replace(' ', '')
+        if p.startswith('0'):
+            p = '972' + p[1:]
+        return f"https://wa.me/{p}?text={encoded}"
     return f"https://wa.me/?text={encoded}"
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 שלום! אני בוט UDATA Lab.\n\n"
-        "📸 שלח לי צילום של מדבקת הדיסק ואני אדאג לכל השאר:\n\n"
-        "✅ יצירת משימה ב-ClickUp\n"
-        "📊 הוספה אוטומטית לטבלה\n"
-        "💬 הודעת קבלה ל-WhatsApp"
+        "📸 שלח לי צילום של מדבקת הדיסק — אני אוצר משימה ב-ClickUp,\n"
+        "אוסיף לטבלה ואכין הודעת קבלה ל-WhatsApp."
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("📷 מעבד תמונה...")
     try:
-        # Download photo
         photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
         image_bytes = await photo_file.download_as_bytearray()
 
@@ -179,38 +195,35 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         task_id = clickup_create_task(task_name, task_desc)
 
-        # ✅ AUTO-ADD TO SHEETS
-        await msg.edit_text("📊 מוסיף לטבלה...")
-        sheets_ok = sheets_add_row(data)
+        # Auto-add to Sheets
+        sheets_add_row(data)
 
-        # Build WhatsApp
-        wa_text = build_wa_intake(data)
-        wa_link = build_wa_link(data, wa_text)
-        cu_link = f"https://app.clickup.com/t/{task_id}"
+        # Save data for callback
+        context.user_data['pending'] = {
+            'data': data,
+            'task_id': task_id
+        }
 
         free_note = "\n🆓 דילר — דיאגנוסטיקה חינם" if is_free_diag(data) else ""
-        sheets_note = "✅" if sheets_ok else "⚠️ בדוק ידנית"
+        media = f"{data['brand']} {data['media_type']} {data['capacity']}"
 
-        reply = (
+        summary = (
             f"✅ *תיק {data['case_number']} נוצר*\n\n"
             f"📱 {data['phone']}{'  (דילר)' if data['is_dealer'] else ''}{free_note}\n"
-            f"💾 {data['brand']} {data['media_type']} {data['capacity']}\n"
+            f"💾 {media}\n"
             f"🔧 {data['model']}\n"
             f"🔑 {data['serial']}\n"
-            f"📊 Sheets: {sheets_note}\n\n"
-            f"*הודעת קבלה (העתק ל-WhatsApp):*\n"
-            f"```\n{wa_text}\n```"
+            f"📊 Sheets: ✅\n\n"
+            f"*איך הגיע הדיסק?*"
         )
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📲 WhatsApp", url=wa_link),
-                InlineKeyboardButton("🔗 ClickUp", url=cu_link),
-            ]
-        ])
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📍 הגיע למעבדה", callback_data="walkin"),
+            InlineKeyboardButton("📬 הגיע דרך שליח", callback_data="mail"),
+        ]])
 
         await msg.delete()
-        await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=keyboard)
+        await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=keyboard)
 
     except json.JSONDecodeError:
         await msg.edit_text("❌ שגיאה בפענוח המדבקה. נסה שוב.")
@@ -220,6 +233,45 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error: {e}", exc_info=True)
         await msg.edit_text(f"❌ שגיאה: {str(e)[:200]}")
 
+async def handle_delivery_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    pending = context.user_data.get('pending')
+    if not pending:
+        await query.edit_message_text("❌ פג תוקף — שלח את התמונה שוב.")
+        return
+
+    data    = pending['data']
+    task_id = pending['task_id']
+    choice  = query.data  # "walkin" or "mail"
+
+    if choice == "walkin":
+        wa_text  = build_wa_walkin(data)
+        delivery = "📍 הגיע למעבדה"
+    else:
+        wa_text  = build_wa_mail(data)
+        delivery = "📬 דואר / שליח"
+
+    wa_link = build_wa_link(data['phone'], wa_text, data.get('is_dealer', False))
+    cu_link = f"https://app.clickup.com/t/{task_id}"
+
+    reply = (
+        f"✅ *תיק {data['case_number']}* — {delivery}\n\n"
+        f"*הודעת קבלה (העתק ל-WhatsApp):*\n"
+        f"```\n{wa_text}\n```"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📲 WhatsApp", url=wa_link),
+            InlineKeyboardButton("🔗 ClickUp", url=cu_link),
+        ]
+    ])
+
+    await query.edit_message_text(reply, parse_mode="Markdown", reply_markup=keyboard)
+    context.user_data.pop('pending', None)
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📸 שלח לי צילום של מדבקת הדיסק")
 
@@ -228,8 +280,9 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CallbackQueryHandler(handle_delivery_choice, pattern="^(walkin|mail)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    logger.info("🤖 UDATA Bot v1.1 started!")
+    logger.info("🤖 UDATA Bot v1.2 started!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
