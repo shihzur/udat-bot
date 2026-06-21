@@ -525,8 +525,19 @@ async def handle_delivery_choice(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text(reply, parse_mode="Markdown", reply_markup=keyboard)
     context.user_data.pop('pending', None)
 
+# Invisible Unicode direction marks that iOS/Android keyboards sometimes inject
+# around text in RTL (Hebrew/Arabic) chat contexts. Must be stripped before any
+# regex matching, otherwise "3103" arrives as "\u200e3103" and silently fails
+# to match CASE_NUMBER_RE / PHONE_RE.
+_INVISIBLE_MARKS_RE = re.compile(
+    "[\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff]"
+)
+
+def clean_text(text: str) -> str:
+    return _INVISIBLE_MARKS_RE.sub("", text or "").strip()
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = clean_text(update.message.text)
 
     # Step 2 of price flow: waiting for "recovered amount" after price was given
     awaiting_recovered = context.user_data.get("awaiting_recovered_for")
