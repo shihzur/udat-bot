@@ -186,7 +186,13 @@ def clickup_move_task(task_id: str, list_id: str) -> bool:
         headers={"Authorization": CLICKUP_TOKEN},
         timeout=15
     )
-    return resp.status_code in (200, 204)
+    if resp.status_code not in (200, 204):
+        logger.error(
+            f"clickup_move_task failed: task={task_id} list={list_id} "
+            f"status={resp.status_code} body={resp.text[:500]}"
+        )
+        return False
+    return True
 
 def clickup_get_task_description(task_id: str) -> str:
     """Fetch full description for a task (list endpoint truncates/omits it)."""
