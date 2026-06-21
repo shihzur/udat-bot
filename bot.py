@@ -99,8 +99,13 @@ def clickup_create_task(name: str, description: str) -> str:
     resp.raise_for_status()
     return resp.json()["id"]
 
-def clickup_get_all_tasks() -> list:
-    """Fetch all team tasks once (used by both case-number and phone search)."""
+_team_id_cache = None
+
+def clickup_get_team_id() -> str:
+    """Fetch and cache the workspace (team) ID — needed for v3 endpoints."""
+    global _team_id_cache
+    if _team_id_cache:
+        return _team_id_cache
     resp = requests.get(
         "https://api.clickup.com/api/v2/team",
         headers={"Authorization": CLICKUP_TOKEN},
@@ -109,9 +114,13 @@ def clickup_get_all_tasks() -> list:
     resp.raise_for_status()
     teams = resp.json().get("teams", [])
     if not teams:
-        return []
-    team_id = teams[0]["id"]
+        raise RuntimeError("No ClickUp teams/workspaces found for this token")
+    _team_id_cache = teams[0]["id"]
+    return _team_id_cache
 
+def clickup_get_all_tasks() -> list:
+    """Fetch all team tasks once (used by both case-number and phone search)."""
+    team_id = clickup_get_team_id()
     resp = requests.get(
         f"https://api.clickup.com/api/v2/team/{team_id}/task",
         headers={"Authorization": CLICKUP_TOKEN},
@@ -181,9 +190,17 @@ def clickup_find_tasks_by_phone(phone_query: str) -> list:
     return matches
 
 def clickup_move_task(task_id: str, list_id: str) -> bool:
-    resp = requests.post(
-        f"https://api.clickup.com/api/v2/list/{list_id}/task/{task_id}",
-        headers={"Authorization": CLICKUP_TOKEN},
+    """Move a task to a new home List, using the v3 endpoint.
+    IMPORTANT: the old v2 endpoint (POST /list/{list_id}/task/{task_id}) adds
+    the task as an *additional* List instead of moving it — ClickUp counts
+    that as a "Tasks in Multiple Lists" (TIML) use, which has a lifetime cap
+    on the Free plan and returns a 403 TIML_001 error once exhausted. The v3
+    "home_list" endpoint performs a real move instead."""
+    team_id = clickup_get_team_id()
+    resp = requests.put(
+        f"https://api.clickup.com/api/v3/workspaces/{team_id}/tasks/{task_id}/home_list/{list_id}",
+        headers={"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"},
+        json={},
         timeout=15
     )
     if resp.status_code not in (200, 204):
