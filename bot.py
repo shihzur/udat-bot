@@ -599,12 +599,17 @@ def build_digest_texts(items: list) -> list:
             mark = "😴" if i["snoozed"] else ("⚠️" if i["overdue"] else "•")
             lines.append(f"{mark} {i['name']} — {fmt_days(i['days'])}")
         blocks.append("\n".join(lines))
-    texts, cur = [], ""
+    # split by LINES so a single long status group can never exceed Telegram's 4096 limit
+    all_lines = []
     for b in blocks:
-        if cur and len(cur) + len(b) + 1 > 3800:
+        all_lines.extend(b.split("\n"))
+    texts, cur = [], ""
+    for ln in all_lines:
+        ln = ln[:300]
+        if cur and len(cur) + len(ln) + 1 > 3800:
             texts.append(cur.strip())
             cur = ""
-        cur += b + "\n"
+        cur += ln + "\n"
     if cur.strip():
         texts.append(cur.strip())
     return texts
