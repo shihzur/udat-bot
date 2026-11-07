@@ -21,6 +21,7 @@ Fixed: show_case_card now works when opened from an inline button
 """
 
 import os, asyncio, base64, json, logging, re, time, requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta, time as dtime
 from urllib.parse import quote
 from dotenv import load_dotenv
@@ -503,23 +504,32 @@ def get_owner_chat_id(app):
         return int(env.strip())
     return app.bot_data.get("last_chat_id")
 
-def clickup_get_open_tasks() -> list:
-    """All open team tasks (paginated)."""
-    team_id = clickup_get_team_id()
+def _fetch_list_tasks(list_id: str) -> list:
+    """All open tasks of ONE list (paginated)."""
     tasks = []
-    for page in range(10):
+    for page in range(20):
         resp = requests.get(
-            f"https://api.clickup.com/api/v2/team/{team_id}/task",
+            f"https://api.clickup.com/api/v2/list/{list_id}/task",
             headers={"Authorization": CLICKUP_TOKEN},
             params={"page": page, "include_closed": "false"},
             timeout=30
         )
         resp.raise_for_status()
         batch = resp.json().get("tasks", [])
+        for t in batch:
+            t["list"] = {"id": list_id}
         tasks.extend(batch)
         if len(batch) < 100:
             break
     return tasks
+
+def clickup_get_open_tasks() -> list:
+    """Open tasks of the working lists only (archive skipped), fetched in parallel.
+    Much faster than the team-wide endpoint, which also drags in the whole archive."""
+    list_ids = [l for l in STATUS_ORDER if l != ARCHIVE_LIST_ID]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(_fetch_list_tasks, list_ids))
+    return [t for r in results for t in r]
 
 def get_snooze_until_ms(task_id: str, list_id: str) -> int:
     """Latest snooze marker written for the CURRENT status (older statuses ignored)."""
@@ -538,9 +548,12 @@ def get_snooze_until_ms(task_id: str, list_id: str) -> int:
 
 def collect_reminder_items() -> list:
     """Blocking: one dict per open (non-archived) case."""
-    now_ms = int(time.time() * 1000)
+    t0 = time.time()
+    now_ms = int(t0 * 1000)
     items = []
-    for t in clickup_get_open_tasks():
+    raw = clickup_get_open_tasks()
+    t_fetch = time.time() - t0
+    for t in raw:
         lid = (t.get("list") or {}).get("id")
         if lid not in STATUS_LISTS or lid == ARCHIVE_LIST_ID:
             continue
@@ -553,11 +566,20 @@ def collect_reminder_items() -> list:
         days = max(0, (now_ms - upd) // 86400000)
         thr = OVERDUE_DAYS.get(lid)
         overdue = thr is not None and days >= thr
-        snoozed = False
-        if overdue:
-            snoozed = get_snooze_until_ms(t["id"], lid) > now_ms
         items.append({"id": t["id"], "case": case, "name": name[:70], "list_id": lid,
-                      "days": days, "overdue": overdue, "snoozed": snoozed})
+                      "days": days, "overdue": overdue, "snoozed": False})
+
+    # snooze markers: one comments request per overdue case, in parallel
+    need = [i for i in items if i["overdue"]]
+    if need:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            untils = list(pool.map(lambda i: get_snooze_until_ms(i["id"], i["list_id"]), need))
+        for i, u in zip(need, untils):
+            i["snoozed"] = u > now_ms
+    logger.info(
+        f"collect_reminder_items: {len(items)} open, {len(need)} overdue, "
+        f"fetch={t_fetch:.1f}s total={time.time() - t0:.1f}s"
+    )
     return items
 
 def build_digest_texts(items: list) -> list:
@@ -642,7 +664,16 @@ async def job_nag(context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.application.bot_data["last_chat_id"] = update.effective_chat.id
-    await send_digest(context.bot, update.effective_chat.id)
+    wait = await update.message.reply_text("⏳ Собираю данные из ClickUp...")
+    try:
+        await send_digest(context.bot, update.effective_chat.id)
+    except Exception as e:
+        logger.error(f"/remind failed: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {str(e)[:200]}")
+    try:
+        await wait.delete()
+    except Exception:
+        pass
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
