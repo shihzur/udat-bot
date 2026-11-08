@@ -83,8 +83,8 @@ STATUS_LISTS = {
         "button": "✅ Готово к выдаче",
     },
     "901817725467": {
-        "label": "❌ Отказ / невозможно восстановить",
-        "button": "❌ Отказ",
+        "label": "❌ Клиент отказался",
+        "button": "❌ Клиент отказался",
     },
     "901817725472": {
         "label": "📦 Архив / выдано",
@@ -431,12 +431,43 @@ async def send_case_photos(message, label, extras) -> bool:
         )
     return not failed
 
+def md_escape(s: str) -> str:
+    """Escape legacy-Markdown special chars so free-text notes can't break the card."""
+    return re.sub(r"([_*`\[])", r"\\\1", s)
+
+def build_notes_block(comments: list, budget: int = 2400, per_note: int = 300) -> str:
+    """Notes (newest first) as a text block INSIDE the case card. '' if there are none."""
+    notes = []
+    for c in comments:
+        txt = (c.get("comment_text") or "").strip()
+        if not txt or SNZ_RE.search(txt):   # skip empty + reminder service markers
+            continue
+        notes.append((int(c.get("date") or 0), txt))
+    if not notes:
+        return ""
+    notes.sort(key=lambda x: x[0], reverse=True)
+
+    head = f"📝 *הערות ({len(notes)}):*"
+    lines, used, shown = [head], len(head), 0
+    for ts, txt in notes:
+        if len(txt) > per_note:
+            txt = txt[:per_note] + "…"
+        line = f"• {fmt_ts(ts)} — {md_escape(txt)}"
+        if used + len(line) > budget:
+            break
+        lines.append(line)
+        used += len(line) + 1
+        shown += 1
+    if shown < len(notes):
+        lines.append(f"… ועוד {len(notes) - shown}")
+    return "\n".join(lines) + "\n\n"
+
 async def send_case_notes(message, comments: list):
     """Send notes (newest first) as plain text (no Markdown: free text may contain *_`)."""
     notes = []
     for c in comments:
         txt = (c.get("comment_text") or "").strip()
-        if not txt:
+        if not txt or SNZ_RE.search(txt):   # skip empty + reminder service markers
             continue
         notes.append((int(c.get("date") or 0), txt))
     if not notes:
@@ -469,6 +500,7 @@ NAG_TIMES       = [dtime(h, 0, tzinfo=LAB_TZ) for h in (12, 14, 16, 18, 20)]
 REMIND_DAYS     = (0, 1, 2, 3, 4, 5)   # PTB: 0=Sunday ... 6=Saturday -> no reminders on Saturday
 ARCHIVE_LIST_ID = "901817725472"
 READY_LIST_ID   = "901817725465"
+REFUSED_LIST_ID = "901817725467"
 CASES_PER_MSG   = 8
 
 # days in the same status after which a case is "overdue" (None = never nag)
@@ -855,6 +887,14 @@ def build_status_keyboard(case_number: str, current_list_id: str, has_price: boo
         InlineKeyboardButton("📷 הוסף תמונה", callback_data=f"photo|{case_number}"),
     ])
 
+    if current_list_id == READY_LIST_ID:
+        rows.append([InlineKeyboardButton("📲 הודעת 'מוכן' ללקוח", callback_data=f"wa|ready|{case_number}")])
+    elif current_list_id == REFUSED_LIST_ID:
+        rows.append([
+            InlineKeyboardButton("📲 הודעת סירוב ללקוח", callback_data=f"wa|refused|{case_number}"),
+            InlineKeyboardButton("📲 לא ניתן לשחזר", callback_data=f"wa|unrec|{case_number}"),
+        ])
+
     row = []
     for list_id in STATUS_ORDER:
         if list_id == current_list_id:
@@ -868,12 +908,180 @@ def build_status_keyboard(case_number: str, current_list_id: str, has_price: boo
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("🚫 Нельзя восстановить", callback_data=f"unrec|{case_number}")])
     return InlineKeyboardMarkup(rows)
+
+def card_contact(card: dict):
+    """(phone_digits_or_'—', is_dealer) from a parsed card. A dealer code/name has no direct WhatsApp number."""
+    raw = card.get("phone") or ""
+    digits = re.sub(r"\D", "", raw)
+    is_dealer = "דילר" in raw or not (9 <= len(digits) <= 12)
+    return ("—" if is_dealer else digits), is_dealer
+
+def build_wa_ready(case_number: str, card: dict) -> str:
+    """WhatsApp text for 'ready for pickup'. Gender-neutral (plural), price shown as typed,
+    VAT-inclusive label added when the price text has no VAT mention, offer to verify data before payment."""
+    media = (card.get("media") or "").strip()
+    head = f"תיק מספר {case_number}" + (f" ({media})" if media and media != "—" else "")
+    lines = ["שלום 😊", "", f"{head} מוכן לאיסוף במעבדה ✅", ""]
+    rec = card.get("recovered")
+    price = card.get("price")
+    if rec:
+        lines.append(f"📦 מידע שוחזר: {rec}")
+    if price:
+        if "מע" not in price:
+            price = f"{price} כולל מע״מ"
+        lines.append(f"💰 עלות העבודה: {price}")
+    if rec or price:
+        lines.append("")
+    lines += [
+        "חשוב: להעברת המידע המשוחזר יש להביא דיסק יעד חדש ובנפח מתאים. "
+        "ההעתקה אורכת זמן ולא תתבצע במקום באותה שעה.",
+        "",
+        "לפני ביצוע התשלום, אם תרצו — ניתן לתאם מראש בדיקה ואישור של המידע המשוחזר.",
+        "",
+        "📍 בית הלל 20, תל אביב. נשמח לתאם מועד מראש.",
+        "",
+        "אני כאן לכל שאלה 😊",
+        "",
+        "UDATA – Data Recovery Lab",
+        "📞 072-249-4570",
+    ]
+    return "\n".join(lines).replace("`", "'")
+
+def build_wa_refused(case_number: str, card: dict, unrecoverable: bool = False) -> str:
+    """WhatsApp text when the client declined the recovery: no extra charge beyond the paid
+    diagnostics (never 'free'/'no cost'), media can be collected within 60 days. Gender-neutral."""
+    media = (card.get("media") or "").strip()
+    head = f"תיק מספר {case_number}" + (f" ({media})" if media and media != "—" else "")
+    if unrecoverable:
+        intro = f"עדכון לגבי {head}: לצערנו, לא ניתן לשחזר את המידע מהמדיה."
+    else:
+        intro = f"עדכון לגבי {head}: הבנו שהחלטתם לא להמשיך בשחזור."
+    lines = [
+        "שלום 😊",
+        "",
+        intro,
+        "",
+        "לא יהיה חיוב נוסף מעבר לעלות הבדיקה.",
+        "",
+        "ניתן לאסוף את המדיה מהמעבדה (בית הלל 20, תל אביב) בתוך 60 יום, בתיאום מראש. "
+        "לאחר מכן המדיה תיחשב כנטושה בהתאם לתנאי השירות.",
+        "",
+        "אני כאן לכל שאלה 😊",
+        "",
+        "UDATA – Data Recovery Lab",
+        "📞 072-249-4570",
+    ]
+    return "\n".join(lines)
+
+async def send_ready_message(message, task_id: str, case_number: str, name: str = "",
+                             kind: str = "ready"):
+    """Prepare a client WhatsApp message (kind: 'ready' = ready for pickup, 'refused' = client declined):
+    copyable text + WhatsApp button."""
+    try:
+        full = await asyncio.to_thread(clickup_get_task_full, task_id)
+        desc = full.get("text_content") or full.get("description") or ""
+        card = parse_task_card(name or full.get("name", ""), desc)
+        if kind == "refused":
+            wa_text = build_wa_refused(case_number, card)
+        elif kind == "unrec":
+            wa_text = build_wa_refused(case_number, card, unrecoverable=True)
+        else:
+            wa_text = build_wa_ready(case_number, card)
+        phone, is_dealer = card_contact(card)
+        link = build_wa_link(phone, wa_text, is_dealer)
+
+        notes = []
+        if kind == "ready" and not card.get("price"):
+            notes.append("⚠️ Цена не указана в карточке — в сообщении нет стоимости. "
+                         "Добавь её кнопкой 💰 в карточке и открой сообщение снова.")
+        if is_dealer:
+            notes.append("ℹ️ Дилер / нет номера телефона — в WhatsApp выбери контакт вручную.")
+
+        rows = []
+        if len(link) <= 2000:
+            rows.append([InlineKeyboardButton("📲 WhatsApp", url=link)])
+        else:
+            notes.append("ℹ️ Сообщение слишком длинное для кнопки — скопируй текст (нажми на него).")
+        notified_btn = InlineKeyboardButton("✅ Клиенту сообщил", callback_data=f"rem|ntf|{case_number}")
+        if kind in ("refused", "unrec"):
+            rows.append([notified_btn])
+        else:
+            rows.append([
+                notified_btn,
+                InlineKeyboardButton("⏰ Через 3 часа", callback_data=f"rem|h3|{case_number}"),
+            ])
+
+        text = f"📲 Сообщение клиенту — кейс {case_number} (нажми на текст, чтобы скопировать)\n"
+        if notes:
+            text += "\n".join(notes) + "\n"
+        text += f"\n```\n{wa_text}\n```"
+        await message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    except Exception as e:
+        logger.error(f"send_ready_message error: {e}", exc_info=True)
+        await message.reply_text(f"❌ Не удалось подготовить сообщение клиенту: {str(e)[:200]}")
+
+async def handle_wa_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, kind, case_number = query.data.split("|")
+    except ValueError:
+        return
+    task = await asyncio.to_thread(clickup_find_task_by_case, case_number)
+    if not task:
+        await query.message.reply_text(f"❌ Кейс {case_number} не найден в ClickUp.")
+        return
+    await send_ready_message(query.message, task["id"], case_number, task.get("name", ""),
+                             kind=kind if kind in ("refused", "unrec") else "ready")
+
+async def handle_unrec_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """'Нельзя восстановить': move the case to the refusals list, note it in ClickUp,
+    and prepare the client message (collect the media within 60 days)."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, case_number = query.data.split("|")
+    except ValueError:
+        return
+    try:
+        task = await asyncio.to_thread(clickup_find_task_by_case, case_number)
+        if not task:
+            await query.message.reply_text(f"❌ Кейс {case_number} не найден в ClickUp.")
+            return
+        if task["list_id"] != REFUSED_LIST_ID:
+            ok = await asyncio.to_thread(clickup_move_task, task["id"], REFUSED_LIST_ID)
+            if not ok:
+                await query.message.reply_text(f"❌ Ошибка переноса кейса {case_number} в ClickUp.")
+                return
+            await asyncio.to_thread(clickup_add_comment, task["id"], "🚫 Нельзя восстановить")
+            cu_link = f"https://app.clickup.com/t/{task['id']}"
+            await query.edit_message_text(
+                f"✅ *תיק {case_number}* הועבר ל:\n❌ Нельзя восстановить",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 פתח ב-ClickUp", url=cu_link)]])
+            )
+        await send_ready_message(query.message, task["id"], case_number, task.get("name", ""), kind="unrec")
+    except Exception as e:
+        logger.error(f"unrec button error: {e}", exc_info=True)
+        await query.message.reply_text(f"❌ Ошибка: {str(e)[:200]}")
 
 def open_card_keyboard(case_number: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(f"📁 הצג כרטיס {case_number}", callback_data=f"open|{case_number}")
     ]])
+
+CARD_RE = re.compile(r"^📁 תיק (\d{3,5})")
+
+def case_from_reply(update: Update):
+    """If the message is a Telegram Reply to one of the bot's case cards, return that case number."""
+    r = update.message.reply_to_message if update.message else None
+    if r and r.from_user and r.from_user.is_bot and r.text:
+        m = CARD_RE.match(r.text.strip())
+        if m:
+            return m.group(1)
+    return None
 
 def clear_awaiting(context: ContextTypes.DEFAULT_TYPE):
     for k in ("awaiting_price_for", "awaiting_recovered_for",
@@ -924,7 +1132,8 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=open_card_keyboard(case_number)
     )
 
-async def save_extra_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, case_number: str):
+async def save_extra_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, case_number: str,
+                           reply_mode: bool = False):
     """Photo sent after pressing '📷 הוסף תמונה' -> attach to the case, no OCR."""
     msg = await update.message.reply_text("📎 שומר תמונה...")
     try:
@@ -942,9 +1151,9 @@ async def save_extra_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         if caption:
             clickup_add_comment(task_id, f"📷 {caption}")
 
+        tail = "" if reply_mode else "\nאפשר לשלוח עוד תמונות, או /done לסיום."
         await msg.edit_text(
-            f"✅ התמונה נשמרה בתיק {case_number}.\n"
-            f"אפשר לשלוח עוד תמונות, או /done לסיום.",
+            f"✅ התמונה נשמרה בתיק {case_number}.{tail}",
             reply_markup=open_card_keyboard(case_number)
         )
     except requests.HTTPError as e:
@@ -955,6 +1164,12 @@ async def save_extra_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         await msg.edit_text(f"❌ שגיאה: {str(e)[:200]}")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Photo sent as a Reply to a case card -> extra photo for that case
+    reply_case = case_from_reply(update)
+    if reply_case:
+        await save_extra_photo(update, context, reply_case, reply_mode=True)
+        return
+
     # If '📷 הוסף תמונה' was pressed -> this is an extra photo for that case, not a new intake
     awaiting_photo = context.user_data.get("awaiting_photo_for")
     if awaiting_photo:
@@ -1086,6 +1301,12 @@ def clean_text(text: str) -> str:
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = clean_text(update.message.text)
+
+    # Reply to a case card -> the text is a note for that case
+    reply_case = case_from_reply(update)
+    if reply_case and text:
+        await save_note(update, context, reply_case, text)
+        return
 
     # Free-text note for a case (after pressing '📝 הערה')
     awaiting_note = context.user_data.get("awaiting_note_for")
@@ -1312,6 +1533,13 @@ async def show_case_card(update: Update, context: ContextTypes.DEFAULT_TYPE, cas
             "description": description,
         }
 
+        try:
+            comments = clickup_get_comments(task["id"])
+        except Exception as e:
+            logger.error(f"get_comments failed: {e}")
+            comments = []
+        notes_block = build_notes_block(comments)
+
         price_line = f"💰 מחיר: *{card['price']}*\n" if card.get("price") else ""
         recovered_line = f"📦 שוחזר: *{card['recovered']}*\n" if card.get("recovered") else ""
 
@@ -1323,22 +1551,17 @@ async def show_case_card(update: Update, context: ContextTypes.DEFAULT_TYPE, cas
             f"{price_line}"
             f"{recovered_line}"
             f"\n📍 סטטוס נוכחי: {current_label}\n\n"
+            f"{notes_block}"
+            f"✍️ הערה / תמונה: השב (Reply) על הכרטיס הזה\n"
             f"בחר/י פעולה:"
         )
         keyboard = build_status_keyboard(case_number, current_list_id, has_price=bool(card.get("price")))
 
-        # Photos + notes first, card with buttons LAST (so the buttons stay at the bottom)
+        # Order: photos -> card with buttons -> notes (notes never come before the card)
         label, extras = split_photos(full)
         photos_ok = True
         if label or extras:
             photos_ok = await send_case_photos(message, label, extras)
-
-        try:
-            comments = clickup_get_comments(task["id"])
-        except Exception as e:
-            logger.error(f"get_comments failed: {e}")
-            comments = []
-        await send_case_notes(message, comments)
 
         if not photos_ok:
             await message.reply_text("⚠️ חלק מהתמונות לא נטענו.")
@@ -1347,7 +1570,12 @@ async def show_case_card(update: Update, context: ContextTypes.DEFAULT_TYPE, cas
             await msg.delete()
         except Exception:
             pass
-        await message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        try:
+            await message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception as e:
+            # a note with odd formatting must never block the card: resend as plain text
+            logger.error(f"card markdown failed, sending plain: {e}")
+            await message.reply_text(text.replace("*", "").replace("\\", ""), reply_markup=keyboard)
 
     except requests.HTTPError as e:
         await msg.edit_text(f"❌ שגיאת ClickUp: {e.response.status_code}")
@@ -1398,20 +1626,20 @@ async def handle_status_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if ok:
             label = STATUS_LISTS[list_id]["label"]
             cu_link = f"https://app.clickup.com/t/{task['id']}"
-            btn_rows = [[InlineKeyboardButton("🔗 פתח ב-ClickUp", url=cu_link)]]
-            extra = ""
-            if list_id == READY_LIST_ID:
-                extra = "\n\n📣 Клиенту сообщил, что готово?"
-                btn_rows.append([
-                    InlineKeyboardButton("✅ Клиенту сообщил", callback_data=f"rem|ntf|{case_number}"),
-                    InlineKeyboardButton("⏰ Через 3 часа", callback_data=f"rem|h3|{case_number}"),
-                ])
-            keyboard = InlineKeyboardMarkup(btn_rows)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔗 פתח ב-ClickUp", url=cu_link)
+            ]])
             await query.edit_message_text(
-                f"✅ *תיק {case_number}* הועבר ל:\n{label}{extra}",
+                f"✅ *תיק {case_number}* הועבר ל:\n{label}",
                 parse_mode="Markdown",
                 reply_markup=keyboard
             )
+            # moved to "Ready for pickup" -> prepare the WhatsApp message for the client right away
+            if list_id == READY_LIST_ID:
+                await send_ready_message(query.message, task["id"], case_number, task.get("name", ""))
+            elif list_id == REFUSED_LIST_ID:
+                await send_ready_message(query.message, task["id"], case_number, task.get("name", ""),
+                                         kind="refused")
         else:
             await query.edit_message_text(f"❌ שגיאה בהעברת תיק {case_number} ב-ClickUp.")
 
@@ -1432,6 +1660,8 @@ def main():
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(MessageHandler(filters.ALL, remember_chat, block=False), group=-1)
     app.add_handler(CallbackQueryHandler(handle_reminder_button, pattern="^rem\\|"))
+    app.add_handler(CallbackQueryHandler(handle_wa_button, pattern="^wa\\|"))
+    app.add_handler(CallbackQueryHandler(handle_unrec_button, pattern="^unrec\\|"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_delivery_choice, pattern="^(walkin|mail)$"))
     app.add_handler(CallbackQueryHandler(handle_price_button, pattern="^price\\|"))
