@@ -2,10 +2,11 @@
 """
 UDATA Lab Telegram Bot - v1.8
 Added in v1.8: REMINDERS
-  * daily digest (10:00 Israel time, Sun-Fri) of ALL open cases by status
-  * persistent nagging (12/14/16/18/20) about cases that are overdue in their
+  * daily digest (10:00 Israel time, Sun-Fri) of ACTIVE cases by status
+    (payment / diagnostics / waiting for signature / in work; finished cases are NOT included)
+  * persistent nagging (12/14/16/18/20) about active cases that are overdue in their
     status, until the owner reacts (✅ Учтено / 😴 +1 день / moves the status)
-  * "Ready for pickup" cases nag immediately until "✅ Клиенту сообщил" is pressed
+  * case lookup now paginates all lists (old version saw only the first 100 team tasks)
   * /remind = digest now, /myid = show chat id (put it into Railway as OWNER_CHAT_ID)
   * state lives in ClickUp (task status + date_updated + comment markers), so it
     survives Railway restarts
@@ -145,15 +146,9 @@ def clickup_get_team_id() -> str:
     return _team_id_cache
 
 def clickup_get_all_tasks() -> list:
-    """Fetch all team tasks once (used by both case-number and phone search)."""
-    team_id = clickup_get_team_id()
-    resp = requests.get(
-        f"https://api.clickup.com/api/v2/team/{team_id}/task",
-        headers={"Authorization": CLICKUP_TOKEN},
-        timeout=20
-    )
-    resp.raise_for_status()
-    return resp.json().get("tasks", [])
+    """All tasks of the pipeline lists incl. archive, fully paginated (used by phone search).
+    (The old team-wide endpoint returned only the first 100 tasks, so older cases were 'not found'.)"""
+    return list(_iter_case_candidates())
 
 def normalize_phone(phone: str) -> str:
     """Strip spaces/dashes, the leading 0, and the 972 country code,
@@ -168,8 +163,7 @@ def normalize_phone(phone: str) -> str:
 def clickup_find_task_by_case(case_number: str):
     """Search team tasks for one whose name starts with the case number.
     Returns {'id', 'name', 'list_id', 'list_name', 'description'} or None."""
-    tasks = clickup_get_all_tasks()
-    for t in tasks:
+    for t in _iter_case_candidates():
         name = t.get("name", "")
         first_token = name.split("|")[0].strip()
         if first_token == case_number or name.startswith(case_number + " "):
@@ -501,6 +495,8 @@ REMIND_DAYS     = (0, 1, 2, 3, 4, 5)   # PTB: 0=Sunday ... 6=Saturday -> no remi
 ARCHIVE_LIST_ID = "901817725472"
 READY_LIST_ID   = "901817725465"
 REFUSED_LIST_ID = "901817725467"
+# reminders (digest + nags) cover ONLY active cases; finished ones (ready/refused/archive) are never sent
+REMIND_LISTS    = {"901817725445", "901817725456", "901817725460", "901817725462"}
 CASES_PER_MSG   = 8
 
 # days in the same status after which a case is "overdue" (None = never nag)
@@ -536,14 +532,14 @@ def get_owner_chat_id(app):
         return int(env.strip())
     return app.bot_data.get("last_chat_id")
 
-def _fetch_list_tasks(list_id: str) -> list:
-    """All open tasks of ONE list (paginated)."""
+def _fetch_list_tasks(list_id: str, max_pages: int = 20, include_closed: bool = False) -> list:
+    """All tasks of ONE list (paginated, 100 per page)."""
     tasks = []
-    for page in range(20):
+    for page in range(max_pages):
         resp = requests.get(
             f"https://api.clickup.com/api/v2/list/{list_id}/task",
             headers={"Authorization": CLICKUP_TOKEN},
-            params={"page": page, "include_closed": "false"},
+            params={"page": page, "include_closed": "true" if include_closed else "false"},
             timeout=30
         )
         resp.raise_for_status()
@@ -555,10 +551,21 @@ def _fetch_list_tasks(list_id: str) -> list:
             break
     return tasks
 
+def _iter_case_candidates():
+    """Tasks of the working lists first (fast, parallel); the big archive only if nothing matched before."""
+    working = [l for l in STATUS_ORDER if l != ARCHIVE_LIST_ID]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda l: _fetch_list_tasks(l, include_closed=True), working))
+    for r in results:
+        for t in r:
+            yield t
+    for t in _fetch_list_tasks(ARCHIVE_LIST_ID, max_pages=60, include_closed=True):
+        yield t
+
 def clickup_get_open_tasks() -> list:
-    """Open tasks of the working lists only (archive skipped), fetched in parallel.
-    Much faster than the team-wide endpoint, which also drags in the whole archive."""
-    list_ids = [l for l in STATUS_ORDER if l != ARCHIVE_LIST_ID]
+    """Open tasks of the ACTIVE lists only (payment / diagnostics / waiting for signature / in work),
+    fetched in parallel. Finished cases (ready, refused, archive) are not reminded about."""
+    list_ids = [l for l in STATUS_ORDER if l in REMIND_LISTS]
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(_fetch_list_tasks, list_ids))
     return [t for r in results for t in r]
@@ -587,7 +594,7 @@ def collect_reminder_items() -> list:
     t_fetch = time.time() - t0
     for t in raw:
         lid = (t.get("list") or {}).get("id")
-        if lid not in STATUS_LISTS or lid == ARCHIVE_LIST_ID:
+        if lid not in REMIND_LISTS:
             continue
         name = t.get("name", "")
         case = name.split("|")[0].strip()
